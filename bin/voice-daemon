@@ -1,0 +1,609 @@
+#!/usr/bin/env python3
+"""Voice dictation daemon.
+
+Design notes:
+  * GPU on-demand: the whisper model is NOT loaded at startup. It loads
+    asynchronously the moment recording starts (overlapping speech with model
+    load) and unloads after VOICE_IDLE_UNLOAD seconds of inactivity, so the
+    dGPU can return to runtime-pm sleep on Pop!_OS hybrid mode.
+  * Robust: single-instance lock, pre-flight checks, recording duration
+    guards, signal handling, graceful save-on-exit, audio-device retry,
+    clipboard fallback when ydotool fails.
+  * Always preserves audio: every recording is flushed to disk before
+    transcription is attempted, so failures never lose your prompt.
+  * Indicator: spawns the voice-indicator process while recording so a
+    layer-shell oscilloscope appears at the screen edge without stealing focus.
+  * Levels broadcast: emits one float32 RMS value per audio block to a unix
+    DGRAM socket so the indicator can render a live waveform.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import fcntl
+import json
+import os
+import shlex
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import traceback
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import sounddevice as sd
+import soundfile as sf
+
+# ---------------------------------------------------------------- config
+ROOT = Path(os.environ.get("VOICE_ROOT", Path.home() / "voice"))
+RECORDINGS = ROOT / "recordings"
+TRANSCRIPTS = ROOT / "transcripts"
+LOGS = ROOT / "logs"
+
+RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+SOCK_PATH = RUNTIME / "voice-daemon.sock"
+LEVELS_SOCK = RUNTIME / "voice-levels.sock"
+LOCK_PATH = RUNTIME / "voice-daemon.lock"
+
+MODEL_NAME = os.environ.get("VOICE_MODEL", "distil-large-v3")
+COMPUTE_TYPE = os.environ.get("VOICE_COMPUTE", "float16")
+DEVICE = os.environ.get("VOICE_DEVICE", "cuda")
+SAMPLE_RATE = 16000
+CHANNELS = 1
+
+IDLE_UNLOAD_SEC = float(os.environ.get("VOICE_IDLE_UNLOAD", "300"))  # 0 = never
+MIN_RECORD_SEC = float(os.environ.get("VOICE_MIN_RECORD_SEC", "0.3"))
+MAX_RECORD_SEC = float(os.environ.get("VOICE_MAX_RECORD_SEC", "900"))  # 15min hard cap
+
+INDICATOR_BIN = os.environ.get("VOICE_INDICATOR_BIN", str(ROOT / "bin" / "voice-indicator"))
+
+
+# ---------------------------------------------------------------- helpers
+def log(msg: str) -> None:
+    line = f"[{dt.datetime.now().isoformat(timespec='seconds')}] {msg}"
+    print(line, flush=True)
+    try:
+        with open(LOGS / "daemon.log", "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def notify(title: str, body: str = "", urgency: str = "normal") -> None:
+    try:
+        subprocess.run(
+            ["notify-send", "-u", urgency, "-a", "voice", "-t", "2500", title, body],
+            check=False, timeout=2,
+        )
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- single instance
+def acquire_singleton_lock() -> int:
+    """Bail out if another voice-daemon is already holding the lock.
+    The fd is intentionally leaked for the process lifetime."""
+    fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log(f"another voice-daemon holds {LOCK_PATH}; exiting.")
+        sys.exit(1)
+    os.write(fd, f"{os.getpid()}\n".encode())
+    return fd
+
+
+# ---------------------------------------------------------------- levels broadcast
+class LevelBroadcaster:
+    """Send a small envelope array per audio block to LEVELS_SOCK (DGRAM).
+
+    Wire format: 1 byte N, then N float32 peak samples.
+    Drops silently if no listener (indicator may be off)."""
+
+    ENVELOPE_POINTS = 16
+
+    def __init__(self, target: Path) -> None:
+        self.target = str(target)
+        self.s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.s.setblocking(False)
+
+    def emit_envelope(self, indata: np.ndarray) -> None:
+        try:
+            n = self.ENVELOPE_POINTS
+            chunk = max(indata.shape[0] // n, 1)
+            env = np.empty(n, dtype=np.float32)
+            for i in range(n):
+                slab = indata[i * chunk : (i + 1) * chunk]
+                env[i] = np.max(np.abs(slab)) if slab.size else 0.0
+            payload = struct.pack("B", n) + env.tobytes()
+            self.s.sendto(payload, self.target)
+        except (FileNotFoundError, ConnectionRefusedError, BlockingIOError, OSError):
+            pass
+        except Exception:
+            # Never let visualization errors kill recording.
+            pass
+
+
+# ---------------------------------------------------------------- indicator manager
+class IndicatorManager:
+    """Spawns/kills the voice-indicator process around recording sessions."""
+
+    def __init__(self, bin_path: str) -> None:
+        self.bin = bin_path
+        self.proc: Optional[subprocess.Popen] = None
+
+    def show(self) -> None:
+        if not Path(self.bin).is_file():
+            log(f"indicator binary missing at {self.bin}; skipping overlay")
+            return
+        if self.proc and self.proc.poll() is None:
+            return
+        try:
+            env = os.environ.copy()
+            env["VOICE_LEVELS_SOCKET"] = str(LEVELS_SOCK)
+            # Force the Wayland GDK backend regardless of what the parent session
+            # has set — layer-shell is Wayland-only, and on COSMIC the user may
+            # have GDK_BACKEND=x11 globally for app-compat (this silently breaks
+            # the indicator otherwise). Discover WAYLAND_DISPLAY if not inherited.
+            env["GDK_BACKEND"] = "wayland"
+            if not env.get("WAYLAND_DISPLAY"):
+                rt = Path(env.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+                for cand in sorted(rt.glob("wayland-*")):
+                    if cand.name.endswith(".lock"):
+                        continue
+                    env["WAYLAND_DISPLAY"] = cand.name
+                    break
+            # Run the indicator with system Python so it sees apt-installed
+            # python3-gi / gir1.2-* bindings (not available in our venv).
+            self.proc = subprocess.Popen(
+                ["/usr/bin/python3", self.bin],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=open(LOGS / "indicator.log", "ab"),
+                start_new_session=True,
+            )
+        except Exception:
+            log("indicator spawn failed:\n" + traceback.format_exc())
+
+    def hide(self) -> None:
+        if not self.proc:
+            return
+        try:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        except Exception:
+            pass
+        self.proc = None
+
+
+# ---------------------------------------------------------------- recorder
+class Recorder:
+    def __init__(self, broadcaster: LevelBroadcaster, on_max_duration) -> None:
+        self.stream: Optional[sd.InputStream] = None
+        self.sf: Optional[sf.SoundFile] = None
+        self.path: Optional[Path] = None
+        self.broadcaster = broadcaster
+        self.on_max_duration = on_max_duration
+        self.lock = threading.Lock()
+        self.recording = False
+        self.started_at: Optional[float] = None
+
+    def _callback(self, indata, frames, time_info, status) -> None:
+        if status:
+            log(f"audio status: {status}")
+        # Persist before anything else so we never lose audio.
+        try:
+            self.sf.write(indata.copy())
+        except Exception:
+            log("audio write failed:\n" + traceback.format_exc())
+        # Envelope array for the oscilloscope indicator.
+        try:
+            self.broadcaster.emit_envelope(indata)
+        except Exception:
+            pass
+        # Hard cap so a stuck session never grows unbounded.
+        if self.started_at and (time.monotonic() - self.started_at) > MAX_RECORD_SEC:
+            try:
+                self.on_max_duration()
+            except Exception:
+                pass
+
+    def start(self) -> Path:
+        with self.lock:
+            if self.recording:
+                return self.path
+            ts = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            self.path = RECORDINGS / f"{ts}.wav"
+            self.sf = sf.SoundFile(
+                str(self.path), mode="w",
+                samplerate=SAMPLE_RATE, channels=CHANNELS, subtype="PCM_16",
+            )
+            try:
+                self.stream = sd.InputStream(
+                    samplerate=SAMPLE_RATE, channels=CHANNELS,
+                    dtype="float32", callback=self._callback,
+                )
+                self.stream.start()
+            except Exception:
+                # Make sure we don't leak a half-open wav if the device fails.
+                self.sf.close()
+                self.sf = None
+                self.path.unlink(missing_ok=True)
+                self.path = None
+                raise
+            self.started_at = time.monotonic()
+            self.recording = True
+            return self.path
+
+    def stop(self) -> tuple[Optional[Path], float]:
+        with self.lock:
+            if not self.recording:
+                return self.path, 0.0
+            duration = time.monotonic() - (self.started_at or time.monotonic())
+            try:
+                self.stream.stop()
+                self.stream.close()
+            finally:
+                self.stream = None
+            try:
+                self.sf.close()
+            finally:
+                self.sf = None
+            self.recording = False
+            self.started_at = None
+            return self.path, duration
+
+
+# ---------------------------------------------------------------- transcriber
+WORKER_BIN = os.environ.get("VOICE_WORKER_BIN", str(ROOT / "bin" / "voice-worker"))
+VENV_PYTHON = os.environ.get("VOICE_PYTHON", sys.executable)
+
+
+class Transcriber:
+    """Subprocess-isolated Whisper model.
+
+    The model lives in a child process (``voice-worker``) so that when it's
+    not needed, the daemon's RSS stays at ~50 MB and VRAM is fully reclaimed
+    when the child exits. The child is started lazily on first use, and
+    killed by ``unload`` after IDLE_UNLOAD_SEC of inactivity.
+
+    The public API mirrors the previous in-process Transcriber so the rest of
+    the daemon doesn't need to change:
+        ensure_loaded() / warm_async() / transcribe(path) / unload() /
+        idle_seconds()  +  truthy ``model`` attribute for status reporting.
+    """
+
+    def __init__(self) -> None:
+        self.proc: Optional[subprocess.Popen] = None
+        self.lock = threading.Lock()
+        self.last_used = time.monotonic()
+        self.loading = threading.Event()
+        self.loading.set()  # not loading
+
+    # Compatibility shim: serve() reads `txr.model is not None` for status.
+    @property
+    def model(self):  # noqa: D401  (returns truthy iff worker is alive)
+        return self.proc if (self.proc and self.proc.poll() is None) else None
+
+    def _spawn(self) -> None:
+        """Spawn the worker and block until it prints READY (or fails)."""
+        if not Path(WORKER_BIN).is_file():
+            raise RuntimeError(f"worker missing at {WORKER_BIN}")
+        log(f"spawning worker ({MODEL_NAME} on {DEVICE}/{COMPUTE_TYPE})…")
+        t0 = time.monotonic()
+        env = os.environ.copy()
+        env["VOICE_MODEL"] = MODEL_NAME
+        env["VOICE_DEVICE"] = DEVICE
+        env["VOICE_COMPUTE"] = COMPUTE_TYPE
+        self.proc = subprocess.Popen(
+            [VENV_PYTHON, WORKER_BIN],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=open(LOGS / "worker.log", "ab"),
+            env=env,
+            bufsize=0,  # we flush ourselves
+        )
+        # Wait for "READY" or "ERROR ..." line.
+        line = self.proc.stdout.readline().decode(errors="replace").strip()
+        if line == "READY":
+            log(f"worker ready ({time.monotonic() - t0:.1f}s)")
+            return
+        # Bad startup — make sure the child is gone before we raise.
+        try:
+            self.proc.kill()
+        except Exception:
+            pass
+        self.proc = None
+        raise RuntimeError(f"worker startup: {line!r}")
+
+    def ensure_loaded(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            self.last_used = time.monotonic()
+            return
+        with self.lock:
+            if self.proc and self.proc.poll() is None:
+                return
+            self.loading.clear()
+            try:
+                self._spawn()
+            finally:
+                self.loading.set()
+                self.last_used = time.monotonic()
+
+    def warm_async(self) -> None:
+        """Kick off ensure_loaded in a background thread (idempotent)."""
+        if (self.proc and self.proc.poll() is None) or not self.loading.is_set():
+            return
+        threading.Thread(target=self.ensure_loaded, name="warm", daemon=True).start()
+
+    def unload(self) -> bool:
+        with self.lock:
+            if not (self.proc and self.proc.poll() is None):
+                self.proc = None
+                return False
+            log("idle: stopping worker (frees RAM + VRAM)")
+            try:
+                self.proc.stdin.write(b"EXIT\n")
+                self.proc.stdin.flush()
+            except Exception:
+                pass
+            try:
+                self.proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=2.0)
+            self.proc = None
+            return True
+
+    def transcribe(self, wav_path: Path, beam_size: int = 5) -> str:
+        self.ensure_loaded()
+        with self.lock:
+            self.last_used = time.monotonic()
+            try:
+                self.proc.stdin.write(f"TRANSCRIBE {wav_path}\n".encode())
+                self.proc.stdin.flush()
+                line = self.proc.stdout.readline().decode(errors="replace").strip()
+            except (BrokenPipeError, OSError) as e:
+                self.proc = None
+                raise RuntimeError(f"worker pipe broken: {e}") from e
+            self.last_used = time.monotonic()
+        if not line:
+            raise RuntimeError("worker closed stream mid-request")
+        try:
+            result = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"worker bad reply: {line!r}") from e
+        if "error" in result:
+            raise RuntimeError(result["error"])
+        return result.get("text", "")
+
+    def idle_seconds(self) -> float:
+        return time.monotonic() - self.last_used
+
+
+def idle_unload_loop(txr: Transcriber, recorder: Recorder, stop_evt: threading.Event) -> None:
+    """Background thread that unloads the model when nobody's used it for a while."""
+    if IDLE_UNLOAD_SEC <= 0:
+        return
+    while not stop_evt.wait(timeout=10.0):
+        if recorder.recording:
+            continue
+        if txr.idle_seconds() >= IDLE_UNLOAD_SEC:
+            txr.unload()
+
+
+# ---------------------------------------------------------------- typing
+def type_text(text: str) -> None:
+    p = subprocess.Popen(["ydotool", "type", "--file", "-"], stdin=subprocess.PIPE)
+    p.communicate(text.encode("utf-8"), timeout=30)
+    if p.returncode != 0:
+        raise RuntimeError(f"ydotool exited with {p.returncode}")
+
+
+def copy_clipboard(text: str) -> None:
+    subprocess.run(["wl-copy"], input=text.encode(), check=False, timeout=3)
+
+
+# ---------------------------------------------------------------- toggle handler
+def handle_toggle(rec: Recorder, txr: Transcriber, ind: IndicatorManager,
+                  toggle_lock: threading.Lock) -> str:
+    if not toggle_lock.acquire(blocking=False):
+        return "ERROR busy: previous toggle still processing"
+    try:
+        if not rec.recording:
+            try:
+                path = rec.start()
+            except Exception as e:
+                log("recorder.start failed:\n" + traceback.format_exc())
+                notify("voice: cannot record", str(e), urgency="critical")
+                return f"ERROR start: {e}"
+            ind.show()
+            txr.warm_async()  # overlap model load with the user's first words
+            log(f"recording → {path.name}")
+            return "RECORDING"
+
+        path, duration = rec.stop()
+        ind.hide()
+
+        if duration < MIN_RECORD_SEC:
+            log(f"discarding {path.name}: only {duration:.2f}s")
+            notify("voice: too short", f"{duration:.2f}s — recording kept", urgency="low")
+            return f"TOO_SHORT {duration:.2f}s"
+
+        log(f"stopped {path.name} ({duration:.2f}s), transcribing…")
+        try:
+            text = txr.transcribe(path)
+        except Exception as e:
+            log("transcribe error:\n" + traceback.format_exc())
+            notify("voice: transcribe failed", f"{e}\nwav saved: {path.name}", urgency="critical")
+            return f"ERROR transcribe: {e}"
+
+        txt_path = TRANSCRIPTS / (path.stem + ".txt")
+        txt_path.write_text(text)
+        log(f"transcript ({len(text)} chars) → {txt_path.name}")
+
+        if not text:
+            notify("voice: empty transcript", path.name, urgency="low")
+            return "EMPTY"
+
+        try:
+            type_text(text)
+        except Exception as e:
+            log("type error:\n" + traceback.format_exc())
+            copy_clipboard(text)
+            notify("voice: typing failed; text in clipboard", str(e), urgency="critical")
+            return f"ERROR type (clipboard fallback): {e}"
+
+        return f"OK {len(text)} chars"
+    finally:
+        toggle_lock.release()
+
+
+def handle_transcribe_file(txr: Transcriber, raw_path: str, do_type: bool) -> str:
+    p = Path(raw_path).expanduser().resolve()
+    if not p.is_file():
+        return f"ERROR no such file: {p}"
+    text = txr.transcribe(p)
+    txt_path = TRANSCRIPTS / (p.stem + ".txt")
+    txt_path.write_text(text)
+    if do_type and text:
+        try:
+            type_text(text)
+        except Exception as e:
+            copy_clipboard(text)
+            return f"ERROR type (clipboard fallback): {e}\n--- TEXT ---\n{text}"
+    return f"OK {len(text)} chars\n--- TEXT ---\n{text}"
+
+
+# ---------------------------------------------------------------- preflight
+def preflight() -> None:
+    for d in (RECORDINGS, TRANSCRIPTS, LOGS):
+        d.mkdir(parents=True, exist_ok=True)
+    # Need a default input device.
+    try:
+        sd.query_devices(kind="input")
+    except Exception as e:
+        log(f"WARNING: no default input device at startup: {e}")
+        notify("voice: no input device", str(e), urgency="critical")
+    # ydotoold socket is a soft requirement (we'll fall back to clipboard).
+    yds = os.environ.get("YDOTOOL_SOCKET", "")
+    if yds and not Path(yds).exists():
+        log(f"WARNING: YDOTOOL_SOCKET={yds} does not exist; ydotoold not running?")
+
+
+# ---------------------------------------------------------------- server
+def serve(rec: Recorder, txr: Transcriber, ind: IndicatorManager,
+          stop_evt: threading.Event) -> None:
+    if SOCK_PATH.exists():
+        SOCK_PATH.unlink()
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(str(SOCK_PATH))
+    os.chmod(SOCK_PATH, 0o600)
+    s.listen(4)
+    s.settimeout(1.0)  # so we can poll stop_evt
+    log(f"listening on {SOCK_PATH}")
+
+    toggle_lock = threading.Lock()
+
+    while not stop_evt.is_set():
+        try:
+            conn, _ = s.accept()
+        except socket.timeout:
+            continue
+        try:
+            data = conn.recv(4096).decode().strip()
+            parts = shlex.split(data) if data else []
+            cmd = parts[0] if parts else ""
+
+            if cmd == "toggle":
+                resp = handle_toggle(rec, txr, ind, toggle_lock)
+            elif cmd == "status":
+                state = "RECORDING" if rec.recording else "IDLE"
+                model = "loaded" if txr.model is not None else "unloaded"
+                resp = f"{state} model={model} idle={txr.idle_seconds():.0f}s"
+            elif cmd == "transcribe" and len(parts) >= 2:
+                do_type = "--type" in parts[2:]
+                resp = handle_transcribe_file(txr, parts[1], do_type)
+            elif cmd == "unload":
+                resp = "OK unloaded" if txr.unload() else "OK already unloaded"
+            elif cmd == "quit":
+                conn.sendall(b"bye\n")
+                conn.close()
+                stop_evt.set()
+                break
+            else:
+                resp = f"unknown command: {data!r}"
+
+            conn.sendall((resp + "\n").encode())
+        except Exception as e:
+            log("conn error:\n" + traceback.format_exc())
+            try:
+                conn.sendall(f"ERROR {e}\n".encode())
+            except Exception:
+                pass
+        finally:
+            conn.close()
+
+
+# ---------------------------------------------------------------- main
+def main() -> int:
+    preflight()
+    acquire_singleton_lock()
+
+    stop_evt = threading.Event()
+    broadcaster = LevelBroadcaster(LEVELS_SOCK)
+    indicator = IndicatorManager(INDICATOR_BIN)
+
+    transcriber = Transcriber()
+    recorder = Recorder(
+        broadcaster,
+        on_max_duration=lambda: log("WARNING: hit MAX_RECORD_SEC; will close on next toggle"),
+    )
+
+    def shutdown(signum, frame):
+        log(f"signal {signum}: shutting down")
+        stop_evt.set()
+        try:
+            if recorder.recording:
+                recorder.stop()
+        except Exception:
+            pass
+        indicator.hide()
+        if SOCK_PATH.exists():
+            SOCK_PATH.unlink()
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    threading.Thread(
+        target=idle_unload_loop,
+        args=(transcriber, recorder, stop_evt),
+        name="idle-unload", daemon=True,
+    ).start()
+
+    notify("voice daemon ready", f"{MODEL_NAME} (idle-unload {int(IDLE_UNLOAD_SEC)}s)")
+
+    try:
+        serve(recorder, transcriber, indicator, stop_evt)
+    finally:
+        if recorder.recording:
+            try:
+                recorder.stop()
+            except Exception:
+                pass
+        indicator.hide()
+        if SOCK_PATH.exists():
+            SOCK_PATH.unlink()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""voice-worker — child process that holds the faster-whisper model.
+
+Spawned by voice-daemon on demand and killed when the daemon goes idle. By
+isolating the heavy weights in this short-lived child, the daemon itself stays
+at ~50 MB RSS / 0 MB VRAM at rest — when this process exits, glibc + CUDA
+fully reclaim every byte.
+
+Protocol (newline-delimited; each side flushes after every message):
+  child  → parent : "READY\\n"     once the model is loaded and warmed up
+  child  → parent : "ERROR <msg>\\n"  on fatal startup failure (exit 1)
+  parent → child  : "TRANSCRIBE <abs-wav-path>\\n"
+  child  → parent : <one-line JSON>{"text": "..."}  or  {"error": "..."}
+  parent → child  : "EXIT\\n"  → child exits 0
+
+Env vars (read at startup):
+  VOICE_MODEL    default "distil-large-v3"
+  VOICE_DEVICE   default "cuda"        (falls back to cpu/int8 on CUDA failure)
+  VOICE_COMPUTE  default "float16"
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import traceback
+from pathlib import Path
+
+import numpy as np
+
+MODEL_NAME = os.environ.get("VOICE_MODEL", "distil-large-v3")
+DEVICE = os.environ.get("VOICE_DEVICE", "cuda")
+COMPUTE_TYPE = os.environ.get("VOICE_COMPUTE", "float16")
+SAMPLE_RATE = 16000
+
+
+def err(msg: str) -> None:
+    sys.stdout.write(f"ERROR {msg}\n")
+    sys.stdout.flush()
+
+
+def main() -> int:
+    try:
+        from faster_whisper import WhisperModel  # heavy import
+        try:
+            model = WhisperModel(MODEL_NAME, device=DEVICE, compute_type=COMPUTE_TYPE)
+        except Exception as e:
+            print(f"[worker] CUDA load failed ({e}); falling back to cpu/int8",
+                  file=sys.stderr, flush=True)
+            model = WhisperModel(MODEL_NAME, device="cpu", compute_type="int8")
+
+        # Warm with 1s of silence so the first real transcribe is fast.
+        warmup = np.zeros(SAMPLE_RATE, dtype=np.float32)
+        list(model.transcribe(warmup, language="en", beam_size=1)[0])
+
+        sys.stdout.write("READY\n")
+        sys.stdout.flush()
+    except Exception as e:
+        err(f"startup: {e}")
+        traceback.print_exc(file=sys.stderr)
+        return 1
+
+    for raw in sys.stdin:
+        line = raw.strip()
+        if not line:
+            continue
+        if line == "EXIT":
+            return 0
+        if line.startswith("TRANSCRIBE "):
+            path = line[len("TRANSCRIBE "):].strip()
+            try:
+                segments, _ = model.transcribe(
+                    path,
+                    language="en",
+                    beam_size=5,
+                    vad_filter=True,
+                    vad_parameters={"min_silence_duration_ms": 300},
+                )
+                text = " ".join(s.text.strip() for s in segments).strip()
+                sys.stdout.write(json.dumps({"text": text}) + "\n")
+            except Exception as e:
+                sys.stdout.write(json.dumps({"error": str(e)}) + "\n")
+            sys.stdout.flush()
+        else:
+            sys.stdout.write(json.dumps({"error": f"unknown: {line!r}"}) + "\n")
+            sys.stdout.flush()
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

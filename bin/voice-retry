@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Re-transcribe a saved wav. Two modes:
+
+  --via-daemon (default): asks the running daemon to transcribe (model already warm,
+      ~0.5-2s for short clips). Saves transcript next to the wav.
+  --standalone           : loads the model in this process. Slower start, but lets
+      you switch to a bigger model (--model large-v3) for one-off retries.
+
+Examples:
+  voice-retry ~/voice/recordings/2026-05-08_14-22-01.wav
+  voice-retry --type ~/voice/recordings/2026-05-08_14-22-01.wav
+  voice-retry --standalone --model large-v3 path/to/file.wav
+"""
+
+import argparse
+import os
+import socket
+import sys
+from pathlib import Path
+
+
+def via_daemon(path: Path, do_type: bool) -> int:
+    sock_path = os.path.join(
+        os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
+        "voice-daemon.sock",
+    )
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(120)
+        s.connect(sock_path)
+    except FileNotFoundError:
+        print(f"voice-daemon not running (no socket at {sock_path}). "
+              "Use --standalone to run without the daemon.", file=sys.stderr)
+        return 2
+
+    flag = " --type" if do_type else ""
+    s.sendall(f'transcribe "{path}"{flag}'.encode())
+    data = b""
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    sys.stdout.write(data.decode(errors="replace"))
+    return 0
+
+
+def standalone(path: Path, model_name: str, do_type: bool) -> int:
+    # Heavy import only on this path.
+    from faster_whisper import WhisperModel
+    import subprocess
+
+    model = WhisperModel(model_name, device="cuda", compute_type="float16")
+    segments, _ = model.transcribe(
+        str(path), language="en", beam_size=5,
+        vad_filter=True, vad_parameters={"min_silence_duration_ms": 300},
+    )
+    text = " ".join(s.text.strip() for s in segments).strip()
+    txt_path = path.with_suffix(".txt")
+    txt_path.write_text(text)
+    print(text)
+    if do_type and text:
+        p = subprocess.Popen(["ydotool", "type", "--file", "-"], stdin=subprocess.PIPE)
+        p.communicate(text.encode("utf-8"), timeout=30)
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("wav", type=Path, help="path to a recorded wav")
+    ap.add_argument("--type", dest="do_type", action="store_true",
+                    help="also type the result into the focused window")
+    ap.add_argument("--standalone", action="store_true",
+                    help="run transcription in this process instead of via the daemon")
+    ap.add_argument("--model", default="distil-large-v3",
+                    help="model name (standalone only). e.g. large-v3, medium.en")
+    args = ap.parse_args()
+
+    path = args.wav.expanduser().resolve()
+    if not path.is_file():
+        print(f"no such file: {path}", file=sys.stderr)
+        return 2
+
+    if args.standalone:
+        return standalone(path, args.model, args.do_type)
+    return via_daemon(path, args.do_type)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

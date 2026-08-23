@@ -1,0 +1,15 @@
+[Unit]
+Description=Voice history & themes GUI (local web app on 127.0.0.1:8765)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# Stdlib only — runs on system python3, no venv needed.
+ExecStart=/usr/bin/python3 /home/shoyo/voice/bin/voice-gui
+Restart=on-failure
+RestartSec=2
+Environment=VOICE_ROOT=/home/shoyo/voice
+
+[Install]
+WantedBy=default.target

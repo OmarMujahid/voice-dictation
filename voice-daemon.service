@@ -1,0 +1,26 @@
+[Unit]
+Description=Voice dictation daemon (faster-whisper, push-to-talk via ydotool)
+After=graphical-session.target sound.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/home/shoyo/voice/venv/bin/python /home/shoyo/voice/bin/voice-daemon
+Restart=on-failure
+RestartSec=3
+Environment=VOICE_ROOT=/home/shoyo/voice
+Environment=VOICE_MODEL=distil-large-v3
+Environment=VOICE_DEVICE=cuda
+Environment=VOICE_COMPUTE=float16
+# CUDA libs come from the pip nvidia-* wheels installed inside the venv.
+# Update the python version in this path if the venv is rebuilt with another python.
+Environment=LD_LIBRARY_PATH=/home/shoyo/voice/venv/lib/python3.12/site-packages/nvidia/cudnn/lib:/home/shoyo/voice/venv/lib/python3.12/site-packages/nvidia/cublas/lib
+# ydotool client reads this to find the user-mode ydotoold socket.
+Environment=YDOTOOL_SOCKET=%t/.ydotool_socket
+# The model is already in ~/.cache/huggingface; without this the worker calls the
+# hub on every start, and a blackholed IPv6 route makes that hang ~18min (python
+# has no happy-eyeballs fallback). Unset it if you switch to an uncached model.
+Environment=HF_HUB_OFFLINE=1
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,14 @@
+{
+  "name": "Karasuno",
+  "colors": {
+    "bg": "#f8eddd",
+    "surface": "#fdf4eaf0",
+    "surface2": "#fceddff0",
+    "border": "#ff872e8c",
+    "accent": "#ff7b28",
+    "accentDeep": "#ed651b",
+    "text": "#322820",
+    "textDim": "#64564ad9",
+    "ball": "#ffffff"
+  }
+}

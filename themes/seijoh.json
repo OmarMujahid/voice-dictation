@@ -1,0 +1,14 @@
+{
+  "name": "Seijoh",
+  "colors": {
+    "bg": "#eef4f2",
+    "surface": "#fbfdfcf2",
+    "surface2": "#f0f7f4f2",
+    "border": "#2fa39a73",
+    "accent": "#2fa39a",
+    "accentDeep": "#1e7a73",
+    "text": "#15302c",
+    "textDim": "#4f6d68d9",
+    "ball": "#ffffff"
+  }
+}

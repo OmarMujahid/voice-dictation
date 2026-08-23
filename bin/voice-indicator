@@ -1,0 +1,380 @@
+#!/usr/bin/python3
+# NOTE: shebang is pinned to system Python on purpose. The indicator depends on
+# python3-gi / gir1.2-* bindings installed via apt, which are NOT visible from
+# the daemon's venv interpreter.
+"""voice-indicator — compact bottom-center pill rendered as a Wayland
+layer-shell overlay.
+
+A small cream-and-tangerine pill floats above the bottom edge of the primary
+monitor while voice-daemon is recording. Subtle Hinata Shoyo / Karasuno
+colorway: warm off-white pill, tangerine accents, a tiny spinning volleyball
+in place of the usual red rec dot.
+
+Layer-shell config (Wayland-only):
+  layer            = OVERLAY (above all normal windows + the dock)
+  anchor           = BOTTOM only (compositor centers the surface horizontally)
+  exclusive_zone   = 0      (does not reserve space)
+  keyboard_mode    = NONE   (never grabs focus)
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import socket
+import struct
+import sys
+import time
+from collections import deque
+from pathlib import Path
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("GtkLayerShell", "0.1")
+from gi.repository import Gtk, GLib, Gdk, GtkLayerShell  # noqa: E402
+import cairo  # noqa: E402
+
+sys.stderr.reconfigure(line_buffering=True)
+
+
+def diag(msg: str) -> None:
+    print(f"[indicator] {msg}", file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------- config
+LEVELS_SOCKET = Path(os.environ.get(
+    "VOICE_LEVELS_SOCKET",
+    Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "voice-levels.sock",
+))
+
+WIDTH_PX  = 280                  # pill width
+HEIGHT_PX = 36                   # pill height
+BOTTOM_MARGIN_PX = 36            # lift off the screen edge
+RADIUS    = HEIGHT_PX / 2        # pill corner radius
+TARGET_FPS = 30
+
+BUFFER_SECONDS = 2.5
+ENVELOPE_HZ_EST = 176.0
+BUFFER_SAMPLES = int(BUFFER_SECONDS * ENVELOPE_HZ_EST * 1.5)
+
+# --- themable palette ----------------------------------------------------
+# Colors come from $VOICE_ROOT/themes/<name>.json (selected by "theme" in
+# $VOICE_ROOT/config.json, written by the voice-gui web app). Any missing or
+# malformed value falls back to the original Karasuno-tangerine palette, so a
+# bad theme file can never break the indicator.
+ROOT = Path(os.environ.get("VOICE_ROOT", Path.home() / "voice"))
+
+_DEFAULT_PALETTE = {
+    "surface":    (0.992, 0.957, 0.918, 0.94),  # #fdf4ea  soft warm cream
+    "surface2":   (0.988, 0.929, 0.875, 0.94),  # gradient end (one shade warmer)
+    "border":     (1.000, 0.530, 0.180, 0.55),
+    "accent":     (1.000, 0.482, 0.157, 1.00),  # #ff7b28  Hinata orange
+    "accentDeep": (0.929, 0.396, 0.106, 1.00),  # #ed651b
+    "text":       (0.196, 0.157, 0.118, 1.00),  # #322820  warm charcoal text
+    "textDim":    (0.392, 0.337, 0.290, 0.85),
+    "ball":       (1.000, 1.000, 1.000, 1.00),
+}
+
+
+def _hex_rgba(value, fallback):
+    """'#rrggbb' or '#rrggbbaa' → (r, g, b, a) floats; fallback on any junk."""
+    try:
+        s = str(value).strip().lstrip("#")
+        if len(s) == 6:
+            s += "ff"
+        if len(s) != 8:
+            return fallback
+        r, g, b, a = (int(s[i:i + 2], 16) / 255.0 for i in (0, 2, 4, 6))
+        return (r, g, b, a)
+    except Exception:
+        return fallback
+
+
+def _load_palette() -> dict:
+    pal = dict(_DEFAULT_PALETTE)
+    try:
+        theme_id = str(json.loads((ROOT / "config.json").read_text()).get("theme", "")).strip()
+        if not theme_id or any(c in theme_id for c in "/\\") or theme_id.startswith("."):
+            return pal
+        colors = json.loads((ROOT / "themes" / f"{theme_id}.json").read_text()).get("colors", {})
+        for role in pal:
+            if role in colors:
+                pal[role] = _hex_rgba(colors[role], pal[role])
+        diag(f"theme '{theme_id}' loaded")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        diag(f"theme load failed ({e}); using defaults")
+    return pal
+
+
+_PAL = _load_palette()
+CREAM_BG       = _PAL["surface"]
+CREAM_BG_END   = _PAL["surface2"]
+ORANGE_BORDER  = _PAL["border"]
+ORANGE         = _PAL["accent"]
+ORANGE_DEEP    = _PAL["accentDeep"]
+INK            = _PAL["text"]
+INK_DIM        = _PAL["textDim"]
+WHITE          = _PAL["ball"]
+
+
+# ---------------------------------------------------------------- indicator
+class Indicator:
+    def __init__(self) -> None:
+        self.samples: deque[float] = deque(maxlen=BUFFER_SAMPLES)
+        for _ in range(BUFFER_SAMPLES):
+            self.samples.append(0.0)
+        self.start_ts = time.monotonic()
+        self.peak_smoothed = 0.0
+        self._draw_count = 0
+
+        self.window = self._build_window()
+        self.area = Gtk.DrawingArea()
+        # Without an explicit min size on the drawing area, GTK can allocate
+        # 0×0 in a borderless toplevel and the draw signal never fires.
+        self.area.set_size_request(WIDTH_PX, HEIGHT_PX)
+        self.area.connect("draw", self._on_draw)
+        self.window.add(self.area)
+        self.window.show_all()
+        diag("window shown")
+
+        self._open_socket()
+        GLib.timeout_add(int(1000 / TARGET_FPS), self._tick)
+
+    # -------- window
+    def _build_window(self) -> Gtk.Window:
+        win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        win.set_app_paintable(True)
+        win.set_decorated(False)
+        win.set_resizable(False)
+
+        screen = win.get_screen()
+        visual = screen.get_rgba_visual() if screen else None
+        if visual is not None:
+            win.set_visual(visual)
+
+        win.set_default_size(WIDTH_PX, HEIGHT_PX)
+        win.set_size_request(WIDTH_PX, HEIGHT_PX)
+
+        GtkLayerShell.init_for_window(win)
+        GtkLayerShell.set_namespace(win, "voice-indicator")
+        GtkLayerShell.set_layer(win, GtkLayerShell.Layer.OVERLAY)
+        # Anchor only to the BOTTOM edge — the compositor will center the
+        # surface horizontally because LEFT and RIGHT are not anchored.
+        GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.BOTTOM, True)
+        GtkLayerShell.set_keyboard_mode(win, GtkLayerShell.KeyboardMode.NONE)
+        GtkLayerShell.set_exclusive_zone(win, 0)
+        GtkLayerShell.set_margin(win, GtkLayerShell.Edge.BOTTOM, BOTTOM_MARGIN_PX)
+        diag(f"layer-shell ready (proto v{GtkLayerShell.get_protocol_version()})")
+        return win
+
+    # -------- audio levels socket
+    def _open_socket(self) -> None:
+        try:
+            LEVELS_SOCKET.parent.mkdir(parents=True, exist_ok=True)
+            if LEVELS_SOCKET.exists():
+                LEVELS_SOCKET.unlink()
+        except Exception:
+            pass
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.sock.setblocking(False)
+        try:
+            self.sock.bind(str(LEVELS_SOCKET))
+            os.chmod(LEVELS_SOCKET, 0o600)
+        except OSError as e:
+            diag(f"cannot bind {LEVELS_SOCKET}: {e}")
+        GLib.io_add_watch(self.sock.fileno(), GLib.IO_IN, self._on_socket)
+
+    def _on_socket(self, _fd, _cond) -> bool:
+        try:
+            while True:
+                data, _ = self.sock.recvfrom(2048)
+                if len(data) < 1:
+                    continue
+                n = data[0]
+                expected = 1 + n * 4
+                if len(data) < expected:
+                    continue
+                samples = struct.unpack(f"<{n}f", data[1:expected])
+                for s in samples:
+                    self.samples.append(float(s))
+        except BlockingIOError:
+            pass
+        except Exception as e:
+            diag(f"socket error: {e}")
+        return True
+
+    # -------- redraw tick
+    def _tick(self) -> bool:
+        recent = list(self.samples)[-32:]
+        peak = max(recent) if recent else 0.0
+        # Snappy attack, slow decay so the volleyball wobble feels lively.
+        if peak > self.peak_smoothed:
+            self.peak_smoothed = peak
+        else:
+            self.peak_smoothed *= 0.92
+        self.area.queue_draw()
+        return True
+
+    # -------- pill path
+    def _pill_path(self, cr: cairo.Context, x: float, y: float, w: float, h: float) -> None:
+        r = h / 2
+        cr.new_path()
+        cr.arc(x + r, y + r, r, math.pi / 2, 3 * math.pi / 2)
+        cr.line_to(x + w - r, y)
+        cr.arc(x + w - r, y + r, r, -math.pi / 2, math.pi / 2)
+        cr.line_to(x + r, y + h)
+        cr.close_path()
+
+    # -------- volleyball glyph (in place of the usual red rec dot)
+    def _draw_volleyball(self, cr: cairo.Context, cx: float, cy: float, r: float,
+                         spin: float, glow: float) -> None:
+        # Outer halo — pulses with mic input.
+        if glow > 0.01:
+            grad = cairo.RadialGradient(cx, cy, r, cx, cy, r + 6 + glow * 4)
+            grad.add_color_stop_rgba(0, *ORANGE[:3], 0.25 + 0.35 * glow)
+            grad.add_color_stop_rgba(1, *ORANGE[:3], 0.0)
+            cr.set_source(grad)
+            cr.arc(cx, cy, r + 7 + glow * 4, 0, 2 * math.pi)
+            cr.fill()
+
+        # White ball.
+        cr.set_source_rgba(*WHITE)
+        cr.arc(cx, cy, r, 0, 2 * math.pi)
+        cr.fill()
+        cr.set_source_rgba(*ORANGE_BORDER)
+        cr.set_line_width(0.8)
+        cr.arc(cx, cy, r - 0.4, 0, 2 * math.pi)
+        cr.stroke()
+
+        # Three curved seams (rotates slowly with `spin`).
+        cr.save()
+        cr.translate(cx, cy)
+        cr.rotate(spin)
+        cr.set_source_rgba(*ORANGE_DEEP)
+        cr.set_line_width(0.85)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        for k in range(3):
+            cr.save()
+            cr.rotate(k * 2 * math.pi / 3)
+            # A leaf-shaped curve crossing through the ball.
+            cr.move_to(-r * 0.95, 0)
+            cr.curve_to(-r * 0.45,  r * 0.55,
+                         r * 0.45,  r * 0.55,
+                         r * 0.95, 0)
+            cr.stroke()
+            cr.restore()
+        cr.restore()
+
+    # -------- main draw
+    def _on_draw(self, _w, cr: cairo.Context) -> bool:
+        alloc = self.area.get_allocation()
+        W, H = alloc.width, alloc.height
+        if self._draw_count < 2:
+            diag(f"draw #{self._draw_count} {W}x{H}")
+            self._draw_count += 1
+
+        # Transparent root.
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+
+        t = time.monotonic() - self.start_ts
+        breath = 0.5 + 0.5 * math.cos(2 * math.pi * 1.1 * t)  # ~1.1 Hz pulse
+
+        # Soft drop shadow under the pill.
+        for off, alpha in ((3, 0.05), (2, 0.07), (1, 0.10)):
+            cr.set_source_rgba(*ORANGE_DEEP[:3], alpha)
+            self._pill_path(cr, 0.5, 0.5 + off, W - 1, H - 1)
+            cr.fill()
+
+        # Pill background — vertical cream gradient.
+        bg = cairo.LinearGradient(0, 0, 0, H)
+        bg.add_color_stop_rgba(0, *CREAM_BG)
+        bg.add_color_stop_rgba(1, *CREAM_BG_END)
+        cr.set_source(bg)
+        self._pill_path(cr, 0.5, 0.5, W - 1, H - 1)
+        cr.fill_preserve()
+        # Tangerine hairline border.
+        cr.set_source_rgba(*ORANGE_BORDER)
+        cr.set_line_width(1.0)
+        cr.stroke()
+
+        # ---- volleyball
+        ball_r = 10
+        ball_x = 16 + ball_r
+        ball_y = H / 2
+        spin = -t * 1.4 + self.peak_smoothed * 6.0
+        glow = (0.25 + 0.45 * breath) + min(self.peak_smoothed * 4.0, 0.55)
+        self._draw_volleyball(cr, ball_x, ball_y, ball_r, spin, glow)
+
+        # ---- timer
+        elapsed = int(t)
+        timer = f"{elapsed // 60:01d}:{elapsed % 60:02d}"
+        cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        text_x = ball_x + ball_r + 10
+        # Tiny "REC" label in deep orange.
+        cr.set_source_rgba(*ORANGE_DEEP)
+        cr.set_font_size(10)
+        cr.move_to(text_x, H / 2 - 3)
+        cr.show_text("REC")
+        # Timer in warm ink, a bit larger.
+        cr.set_font_size(13)
+        cr.set_source_rgba(*INK)
+        cr.move_to(text_x, H / 2 + 10)
+        cr.show_text(timer)
+        timer_w = cr.text_extents(timer).width
+        scope_x0 = text_x + max(timer_w, 34) + 12
+
+        # ---- mini scope
+        scope_x1 = W - 14
+        if scope_x1 > scope_x0 + 30:
+            self._draw_scope(cr, scope_x0, H * 0.22, scope_x1, H * 0.78)
+
+        return False
+
+    # -------- mini-scope: a single thin tangerine line above a faint baseline
+    def _draw_scope(self, cr: cairo.Context, x0: float, y0: float,
+                    x1: float, y1: float) -> None:
+        w = int(x1 - x0)
+        if w <= 1:
+            return
+        cy = (y0 + y1) / 2
+        max_amp = (y1 - y0) / 2
+
+        # Faint baseline.
+        cr.set_source_rgba(*INK_DIM[:3], 0.18)
+        cr.set_line_width(0.6)
+        cr.move_to(x0, cy)
+        cr.line_to(x1, cy)
+        cr.stroke()
+
+        # Pull recent samples (one per pixel column).
+        all_samples = list(self.samples)
+        if len(all_samples) >= w:
+            visible = all_samples[-w:]
+        else:
+            visible = [0.0] * (w - len(all_samples)) + all_samples
+
+        gain = 3.5
+        cr.set_source_rgba(*ORANGE)
+        cr.set_line_width(1.0)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.move_to(x0, cy)
+        for i, v in enumerate(visible):
+            amp = min(abs(v) * gain, 1.0) * max_amp
+            cr.line_to(x0 + i, cy - amp)
+        cr.stroke()
+
+
+def main() -> int:
+    Indicator()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

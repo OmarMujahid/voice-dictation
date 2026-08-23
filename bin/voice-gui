@@ -1,0 +1,529 @@
+#!/usr/bin/env python3
+"""voice-gui — local web app for browsing recordings, transcripts and themes.
+
+A deliberately separate process from voice-daemon (a GUI crash must never take
+down dictation). Stdlib only, so it runs on the system python3 — no venv.
+
+  * serves the static UI from $VOICE_ROOT/lib/webui on http://127.0.0.1:8765
+  * lists recordings/ + transcripts/ as one timeline (matched by file stem)
+  * streams wav audio with HTTP Range support so seeking works in <audio>
+  * proxies a few commands to the daemon's unix socket (status, toggle,
+    re-transcribe — the model stays warm in the daemon's worker)
+  * reads/writes themes/*.json and the active theme in config.json; the same
+    theme files drive the Cairo palette in voice-indicator
+
+Endpoints:
+  GET    /                       UI
+  GET    /static/<file>          assets
+  GET    /api/items              timeline JSON (recordings ∪ transcripts)
+  GET    /api/audio/<stem>.wav   wav stream (Range supported)
+  GET    /api/status             daemon state {daemon, recording, model, busy}
+  POST   /api/toggle             start/stop recording (same as the hotkey)
+  POST   /api/retranscribe       {"name": stem} → fresh transcript via daemon
+  DELETE /api/item/<stem>        remove wav + txt
+  GET    /api/themes             {"active": id, "themes": [...]}
+  POST   /api/theme              {"id": ...} → set active theme
+  POST   /api/themes             {"id"?, "name", "colors"} → save custom theme
+  DELETE /api/themes/<id>        remove a custom theme (not builtin/active)
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import re
+import signal
+import socket
+import sys
+import threading
+import wave
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+# ---------------------------------------------------------------- config
+ROOT = Path(os.environ.get("VOICE_ROOT", Path.home() / "voice"))
+RECORDINGS = ROOT / "recordings"
+TRANSCRIPTS = ROOT / "transcripts"
+THEMES_DIR = ROOT / "themes"
+CONFIG_PATH = ROOT / "config.json"
+WEBROOT = ROOT / "lib" / "webui"
+LOGS = ROOT / "logs"
+
+HOST = os.environ.get("VOICE_GUI_HOST", "127.0.0.1")
+PORT = int(os.environ.get("VOICE_GUI_PORT", "8765"))
+
+DAEMON_SOCK = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
+    "voice-daemon.sock",
+)
+
+BUILTIN_THEMES = {"karasuno", "phosphor", "nekoma", "seijoh"}
+DEFAULT_THEME = "karasuno"
+THEME_ROLES = {"bg", "surface", "surface2", "border", "accent",
+               "accentDeep", "text", "textDim", "ball"}
+
+STEM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$")
+
+CTYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+    ".woff2": "font/woff2",
+}
+
+_log_lock = threading.Lock()
+
+
+def log(msg: str) -> None:
+    line = f"[{dt.datetime.now().isoformat(timespec='seconds')}] {msg}"
+    print(line, flush=True)
+    try:
+        with _log_lock, open(LOGS / "gui.log", "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- daemon client
+class DaemonOffline(Exception):
+    pass
+
+
+class DaemonBusy(Exception):
+    pass
+
+
+def daemon_cmd(cmd: str, timeout: float = 10.0) -> str:
+    """One request/response over the daemon's unix socket (1 reply per conn)."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(DAEMON_SOCK)
+    except (FileNotFoundError, ConnectionRefusedError) as e:
+        raise DaemonOffline(str(e)) from e
+    try:
+        s.sendall(cmd.encode())
+        data = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        return data.decode(errors="replace").strip()
+    except socket.timeout as e:
+        # Daemon handles connections serially; a long transcription blocks it.
+        raise DaemonBusy("daemon busy") from e
+    finally:
+        s.close()
+
+
+# ---------------------------------------------------------------- items
+_duration_cache: dict[str, tuple[float, int, float]] = {}  # stem → (mtime, size, dur)
+
+
+def wav_duration(path: Path, mtime: float, size: int) -> float | None:
+    cached = _duration_cache.get(path.stem)
+    if cached and cached[0] == mtime and cached[1] == size:
+        return cached[2]
+    try:
+        with wave.open(str(path), "rb") as w:
+            rate = w.getframerate()
+            dur = (w.getnframes() / rate) if rate else 0.0
+    except Exception:
+        return None
+    _duration_cache[path.stem] = (mtime, size, dur)
+    return dur
+
+
+def stem_timestamp(stem: str, fallback_mtime: float) -> str:
+    try:
+        return dt.datetime.strptime(stem, "%Y-%m-%d_%H-%M-%S").isoformat()
+    except ValueError:
+        return dt.datetime.fromtimestamp(fallback_mtime).isoformat()
+
+
+def list_items() -> dict:
+    items, total_bytes, total_seconds = [], 0, 0.0
+    wavs = {p.stem: p for p in RECORDINGS.glob("*.wav") if not p.name.startswith(".")}
+    txts = {p.stem: p for p in TRANSCRIPTS.glob("*.txt") if not p.name.startswith(".")}
+    for stem in sorted(set(wavs) | set(txts), reverse=True):
+        if not STEM_RE.match(stem):
+            continue
+        entry: dict = {"name": stem, "hasAudio": stem in wavs,
+                       "bytes": 0, "duration": None, "text": None}
+        mtime = 0.0
+        if stem in wavs:
+            try:
+                st = wavs[stem].stat()
+                mtime, entry["bytes"] = st.st_mtime, st.st_size
+                total_bytes += st.st_size
+                dur = wav_duration(wavs[stem], st.st_mtime, st.st_size)
+                if dur:
+                    entry["duration"] = round(dur, 2)
+                    total_seconds += dur
+            except OSError:
+                continue
+        if stem in txts:
+            try:
+                if not mtime:
+                    mtime = txts[stem].stat().st_mtime
+                entry["text"] = txts[stem].read_text(errors="replace").strip()
+            except OSError:
+                pass
+        entry["ts"] = stem_timestamp(stem, mtime)
+        items.append(entry)
+    return {"items": items, "count": len(items),
+            "bytes": total_bytes, "seconds": round(total_seconds)}
+
+
+# ---------------------------------------------------------------- themes
+def atomic_write(path: Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
+def read_config() -> dict:
+    try:
+        cfg = json.loads(CONFIG_PATH.read_text())
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def active_theme_id() -> str:
+    tid = str(read_config().get("theme", DEFAULT_THEME))
+    return tid if STEM_RE.match(tid) else DEFAULT_THEME
+
+
+def list_themes() -> dict:
+    themes = []
+    for p in sorted(THEMES_DIR.glob("*.json")):
+        if not STEM_RE.match(p.stem):
+            continue
+        try:
+            data = json.loads(p.read_text())
+            themes.append({
+                "id": p.stem,
+                "name": str(data.get("name", p.stem)),
+                "builtin": p.stem in BUILTIN_THEMES,
+                "colors": {k: v for k, v in data.get("colors", {}).items()
+                           if k in THEME_ROLES and isinstance(v, str)},
+            })
+        except Exception:
+            log(f"skipping unreadable theme {p.name}")
+    return {"active": active_theme_id(), "themes": themes}
+
+
+def slugify(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:48]
+    return slug or "theme"
+
+
+# ---------------------------------------------------------------- HTTP handler
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "voice-gui/1.0"
+
+    # -------- plumbing
+    def log_message(self, fmt, *args):  # quiet per-request spam; errors only
+        pass
+
+    def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _json(self, code: int, obj) -> None:
+        self._send(code, json.dumps(obj).encode(), "application/json; charset=utf-8")
+
+    def _read_json(self) -> dict | None:
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            if n <= 0 or n > 1_000_000:
+                return None
+            obj = json.loads(self.rfile.read(n))
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+
+    def _stem_from(self, prefix: str, strip_ext: str = "") -> str | None:
+        name = self.path[len(prefix):]
+        if strip_ext and name.endswith(strip_ext):
+            name = name[: -len(strip_ext)]
+        return name if STEM_RE.match(name) else None
+
+    # -------- static
+    def _serve_static(self, rel: str) -> None:
+        if not re.match(r"^[A-Za-z0-9._-]+$", rel) or rel.startswith("."):
+            return self._json(404, {"error": "not found"})
+        path = WEBROOT / rel
+        if not path.is_file():
+            return self._json(404, {"error": "not found"})
+        ctype = CTYPES.get(path.suffix, "application/octet-stream")
+        self._send(200, path.read_bytes(), ctype)
+
+    # -------- audio with Range
+    def _serve_audio(self, stem: str) -> None:
+        path = RECORDINGS / f"{stem}.wav"
+        if not path.is_file():
+            return self._json(404, {"error": "no such recording"})
+        size = path.stat().st_size
+        start, end = 0, size - 1
+        rng = self.headers.get("Range")
+        is_partial = False
+        if rng:
+            m = re.match(r"bytes=(\d*)-(\d*)$", rng.strip())
+            if m and (m.group(1) or m.group(2)):
+                if m.group(1):
+                    start = int(m.group(1))
+                    if m.group(2):
+                        end = min(int(m.group(2)), size - 1)
+                else:  # suffix form: bytes=-N
+                    start = max(size - int(m.group(2)), 0)
+                if start > end or start >= size:
+                    return self._send(416, b"", "audio/wav",
+                                      {"Content-Range": f"bytes */{size}"})
+                is_partial = True
+        length = end - start + 1
+        self.send_response(206 if is_partial else 200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(length))
+        if is_partial:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # browser aborted (seek/close) — normal
+
+    # -------- GET
+    def do_GET(self):
+        try:
+            path = self.path.split("?", 1)[0]
+            if path == "/" or path == "/index.html":
+                return self._serve_static("index.html")
+            if path.startswith("/static/"):
+                return self._serve_static(path[len("/static/"):])
+            if path == "/api/items":
+                return self._json(200, list_items())
+            if path == "/api/themes":
+                return self._json(200, list_themes())
+            if path == "/api/status":
+                return self._api_status()
+            if path.startswith("/api/audio/"):
+                stem = self._stem_from("/api/audio/", ".wav")
+                if not stem:
+                    return self._json(400, {"error": "bad name"})
+                return self._serve_audio(stem)
+            return self._json(404, {"error": "not found"})
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            log(f"GET {self.path} failed: {e!r}")
+            try:
+                self._json(500, {"error": str(e)})
+            except Exception:
+                pass
+
+    do_HEAD = do_GET
+
+    def _api_status(self) -> None:
+        try:
+            raw = daemon_cmd("status", timeout=2.5)
+            self._json(200, {
+                "daemon": True, "busy": False, "raw": raw,
+                "recording": raw.startswith("RECORDING"),
+                "model": "loaded" if "model=loaded" in raw else "unloaded",
+            })
+        except DaemonOffline:
+            self._json(200, {"daemon": False, "busy": False,
+                             "recording": False, "model": "unloaded"})
+        except DaemonBusy:
+            # Serial daemon is mid-transcription; report busy, not dead.
+            self._json(200, {"daemon": True, "busy": True,
+                             "recording": False, "model": "loaded"})
+
+    # -------- POST
+    def do_POST(self):
+        try:
+            if self.path == "/api/toggle":
+                return self._api_toggle()
+            if self.path == "/api/retranscribe":
+                return self._api_retranscribe()
+            if self.path == "/api/theme":
+                return self._api_set_theme()
+            if self.path == "/api/themes":
+                return self._api_save_theme()
+            return self._json(404, {"error": "not found"})
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            log(f"POST {self.path} failed: {e!r}")
+            try:
+                self._json(500, {"error": str(e)})
+            except Exception:
+                pass
+
+    def _api_toggle(self) -> None:
+        try:
+            raw = daemon_cmd("toggle", timeout=600)
+            self._json(200, {"ok": not raw.startswith("ERROR"), "raw": raw})
+        except DaemonOffline:
+            self._json(502, {"error": "voice-daemon is not running"})
+        except DaemonBusy:
+            self._json(409, {"error": "daemon busy — try again in a moment"})
+
+    def _api_retranscribe(self) -> None:
+        body = self._read_json() or {}
+        stem = str(body.get("name", ""))
+        if not STEM_RE.match(stem):
+            return self._json(400, {"error": "bad name"})
+        wav = RECORDINGS / f"{stem}.wav"
+        if not wav.is_file():
+            return self._json(404, {"error": "no such recording"})
+        try:
+            raw = daemon_cmd(f'transcribe "{wav}"', timeout=600)
+        except DaemonOffline:
+            return self._json(502, {"error": "voice-daemon is not running"})
+        except DaemonBusy:
+            return self._json(409, {"error": "daemon busy — try again in a moment"})
+        if raw.startswith("ERROR"):
+            return self._json(502, {"error": raw})
+        text = raw.split("--- TEXT ---\n", 1)[1] if "--- TEXT ---\n" in raw else ""
+        self._json(200, {"ok": True, "text": text})
+
+    def _api_set_theme(self) -> None:
+        body = self._read_json() or {}
+        tid = str(body.get("id", ""))
+        if not STEM_RE.match(tid) or not (THEMES_DIR / f"{tid}.json").is_file():
+            return self._json(400, {"error": "no such theme"})
+        cfg = read_config()
+        cfg["theme"] = tid
+        atomic_write(CONFIG_PATH, json.dumps(cfg, indent=2) + "\n")
+        self._json(200, {"ok": True, "active": tid})
+
+    def _api_save_theme(self) -> None:
+        body = self._read_json() or {}
+        name = str(body.get("name", "")).strip()[:64]
+        colors = body.get("colors")
+        if not name or not isinstance(colors, dict):
+            return self._json(400, {"error": "need name + colors"})
+        clean = {k: v.lower() for k, v in colors.items()
+                 if k in THEME_ROLES and isinstance(v, str) and HEX_RE.match(v)}
+        if not clean:
+            return self._json(400, {"error": "no valid colors"})
+        tid = str(body.get("id") or slugify(name))
+        if not STEM_RE.match(tid):
+            return self._json(400, {"error": "bad id"})
+        if tid in BUILTIN_THEMES and not (THEMES_DIR / f"{tid}.json").is_file():
+            pass  # restoring a deleted builtin is fine
+        elif tid in BUILTIN_THEMES and "id" not in body:
+            tid = f"{tid}-custom"
+        atomic_write(THEMES_DIR / f"{tid}.json",
+                     json.dumps({"name": name, "colors": clean}, indent=2) + "\n")
+        log(f"theme saved: {tid}")
+        self._json(200, {"ok": True, "id": tid})
+
+    # -------- DELETE
+    def do_DELETE(self):
+        try:
+            if self.path.startswith("/api/item/"):
+                return self._api_delete_item()
+            if self.path.startswith("/api/themes/"):
+                return self._api_delete_theme()
+            return self._json(404, {"error": "not found"})
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            log(f"DELETE {self.path} failed: {e!r}")
+            try:
+                self._json(500, {"error": str(e)})
+            except Exception:
+                pass
+
+    def _api_delete_item(self) -> None:
+        stem = self._stem_from("/api/item/")
+        if not stem:
+            return self._json(400, {"error": "bad name"})
+        # Refuse while recording: the newest wav is an open file the daemon
+        # is still writing/transcribing.
+        try:
+            if daemon_cmd("status", timeout=1.5).startswith("RECORDING"):
+                return self._json(409, {"error": "recording in progress"})
+        except (DaemonOffline, DaemonBusy):
+            pass
+        removed = []
+        for p in (RECORDINGS / f"{stem}.wav", TRANSCRIPTS / f"{stem}.txt"):
+            if p.is_file():
+                p.unlink()
+                removed.append(p.name)
+        if not removed:
+            return self._json(404, {"error": "no such item"})
+        _duration_cache.pop(stem, None)
+        log(f"deleted: {', '.join(removed)}")
+        self._json(200, {"ok": True, "removed": removed})
+
+    def _api_delete_theme(self) -> None:
+        tid = self._stem_from("/api/themes/")
+        if not tid:
+            return self._json(400, {"error": "bad id"})
+        if tid in BUILTIN_THEMES:
+            return self._json(403, {"error": "builtin themes can't be deleted"})
+        if tid == active_theme_id():
+            return self._json(409, {"error": "theme is active — switch first"})
+        p = THEMES_DIR / f"{tid}.json"
+        if not p.is_file():
+            return self._json(404, {"error": "no such theme"})
+        p.unlink()
+        log(f"theme deleted: {tid}")
+        self._json(200, {"ok": True})
+
+
+# ---------------------------------------------------------------- main
+def main() -> int:
+    for d in (RECORDINGS, TRANSCRIPTS, THEMES_DIR, LOGS):
+        d.mkdir(parents=True, exist_ok=True)
+    if not (WEBROOT / "index.html").is_file():
+        log(f"WARNING: {WEBROOT}/index.html missing — UI will 404")
+
+    srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    srv.daemon_threads = True
+
+    def shutdown(signum, frame):
+        log(f"signal {signum}: shutting down")
+        threading.Thread(target=srv.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    log(f"listening on http://{HOST}:{PORT} (root: {ROOT})")
+    srv.serve_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

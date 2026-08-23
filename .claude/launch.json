@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "voice-gui",
+      "runtimeExecutable": "./bin/voice-gui",
+      "runtimeArgs": [],
+      "port": 8765
+    }
+  ]
+}

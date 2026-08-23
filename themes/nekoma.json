@@ -1,0 +1,14 @@
+{
+  "name": "Nekoma",
+  "colors": {
+    "bg": "#131015",
+    "surface": "#1d171af2",
+    "surface2": "#241b1ff2",
+    "border": "#e0413973",
+    "accent": "#e8463d",
+    "accentDeep": "#c4332b",
+    "text": "#f4e9e6",
+    "textDim": "#a89490d9",
+    "ball": "#f7f1ea"
+  }
+}

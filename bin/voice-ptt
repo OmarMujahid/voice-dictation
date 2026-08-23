@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""Tiny client for voice-daemon. Bound to a hotkey by COSMIC.
+
+Usage:
+    voice-ptt              # toggle recording (start or stop+transcribe)
+    voice-ptt status       # print IDLE or RECORDING
+    voice-ptt quit         # ask the daemon to exit
+"""
+
+import os
+import socket
+import sys
+
+SOCK = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
+    "voice-daemon.sock",
+)
+
+
+def main() -> int:
+    cmd = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "toggle"
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(60)
+        s.connect(SOCK)
+        s.sendall(cmd.encode())
+        # Print whatever the daemon returns (1 reply per connection).
+        data = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        sys.stdout.write(data.decode(errors="replace"))
+        return 0
+    except FileNotFoundError:
+        print(f"voice-daemon not running (no socket at {SOCK})", file=sys.stderr)
+        return 2
+    except Exception as e:
+        print(f"voice-ptt error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

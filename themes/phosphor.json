@@ -1,0 +1,14 @@
+{
+  "name": "Phosphor",
+  "colors": {
+    "bg": "#070b08",
+    "surface": "#0d130ef0",
+    "surface2": "#101a12f0",
+    "border": "#2dff7059",
+    "accent": "#2dff70",
+    "accentDeep": "#18c553",
+    "text": "#d6ffe2",
+    "textDim": "#79a387cc",
+    "ball": "#eafff0"
+  }
+}
